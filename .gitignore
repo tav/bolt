@@ -1,6 +1,7 @@
 # specific files/directories
 
-cmd/bolt
+bolt
+pkg/
 
 # minified css/js files
 
