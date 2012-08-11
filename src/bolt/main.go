@@ -64,7 +64,7 @@ func (r Registry) Keys() []string {
 	return keys
 }
 
-func (r Registry) Main(args []string) {
+func (r Registry) Main(ctx *Context, args []string) {
 	opts := optparse.Parser("Usage: bolt <command-1> <command-2> ... [options]\n", "bolt 0.1")
 	opts.String([]string{"--boltfile"}, "",
 		"use the Boltfile at the given path", "PATH")
@@ -74,7 +74,8 @@ func (r Registry) Main(args []string) {
 		"recompile the generated executable instead of using cached builds")
 	noConsoleLog := opts.BoolConfig("no-console-log", false,
 		"disable logging to the console [false]")
-	opts.Completer = optparse.ListCompleter(r.Keys()...)
+	completions := append(ctx.completions, r.Keys()...)
+	opts.Completer = optparse.ListCompleter(completions...)
 	opts.Parse(args)
 	if len(args) == 1 {
 		listing := r.Listing()
@@ -88,7 +89,7 @@ func (r Registry) Main(args []string) {
 	yaml.NormaliseID(buf, args[1])
 	cmd := buf.String()
 	if task, ok := r[cmd]; ok {
-		task.Func.Call(nil)
+		task.Func.Call([]reflect.Value{reflect.ValueOf(ctx)})
 	} else {
 		fmt.Printf("Task not found:\n\n\t%s\n\n", args[1])
 		runtime.Exit(1)
@@ -116,6 +117,6 @@ func Register(id, doc string, task interface{}) error {
 	return RegisterAt(DefaultRegistry, id, doc, task)
 }
 
-func Main() {
-	DefaultRegistry.Main(os.Args)
+func Main(ctx *Context) {
+	DefaultRegistry.Main(ctx, os.Args)
 }
