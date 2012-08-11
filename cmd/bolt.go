@@ -32,6 +32,7 @@ type Task struct {
 }
 
 type Spec struct {
+	Extra   int
 	FileSet *token.FileSet
 	Init    bool
 	Root    interface{}
@@ -73,7 +74,55 @@ func exitForParserErrors(filename string, err error) {
 	}
 }
 
+func addImport(file *ast.File, pkg string) {
+	decl := &ast.GenDecl{
+		Tok: token.IMPORT,
+	}
+	file.Decls = append(file.Decls, nil)
+	copy(file.Decls[1:], file.Decls[:])
+	file.Decls[0] = decl
+	spec := &ast.ImportSpec{
+		Path: &ast.BasicLit{
+			Kind:  token.STRING,
+			Value: pkg,
+		},
+	}
+	decl.Specs = append(decl.Specs, spec)
+	file.Imports = append(file.Imports, spec)
+}
+
+func insertBoltContext(funcDecl *ast.FuncDecl) {
+	params := funcDecl.Type.Params
+	list := params.List
+	setctx := true
+	if len(list) > 0 {
+		if expr, ok := list[0].Type.(*ast.StarExpr); ok {
+			if sel, ok := expr.X.(*ast.SelectorExpr); ok {
+				if sel.X.(*ast.Ident).Name == "bolt" && sel.Sel.Name == "Context" {
+					setctx = false
+				}
+			}
+		}
+	}
+	if setctx {
+		param := &ast.Field{
+			Names: []*ast.Ident{{Name: "ctx"}},
+			Type: &ast.StarExpr{
+				X: &ast.SelectorExpr{
+					X:   &ast.Ident{Name: "bolt"},
+					Sel: &ast.Ident{Name: "Context"},
+				},
+			},
+		}
+		params.List = append(params.List, nil)
+		copy(params.List[1:], params.List[:])
+		params.List[0] = param
+	}
+}
+
 func parseBoltfile(boltpath, boltdir string) (*Spec, error) {
+
+	extra := 0
 
 	// Open the Boltfile for parsing.
 	boltfile, err := os.Open(boltpath)
@@ -88,6 +137,7 @@ func parseBoltfile(boltpath, boltdir string) (*Spec, error) {
 	if err != nil {
 		// If `package main` has been omitted, auto-insert it.
 		if strings.Contains(err.Error(), "expected 'package'") {
+			extra += 1
 			buf := &bytes.Buffer{}
 			buf.Write([]byte("package main\n"))
 			boltfile.Seek(0, 0)
@@ -102,39 +152,34 @@ func parseBoltfile(boltpath, boltdir string) (*Spec, error) {
 		}
 	}
 
-	// Check if the `bolt` package has been imported.
+	// Check if the `bolt` and `fmt` packages have been imported.
 	boltImported := false
+	fmtImported := false
 	for _, spec := range f.Imports {
 		path, err := strconv.Unquote(spec.Path.Value)
 		if err != nil {
 			continue
 		}
-		if path == "bolt" {
+		switch path {
+		case "bolt":
 			boltImported = true
-			break
+		case "fmt":
+			fmtImported = true
 		}
 	}
 
-	// If not, auto-insert it.
+	// If not, auto-insert them.
 	if !boltImported {
-		impDecl := &ast.GenDecl{
-			Tok: token.IMPORT,
-		}
-		impSpec := &ast.ImportSpec{
-			Path: &ast.BasicLit{
-				Kind:  token.STRING,
-				Value: `"bolt"`,
-			},
-		}
-		f.Decls = append(f.Decls, nil)
-		copy(f.Decls[1:], f.Decls[:])
-		f.Decls[0] = impDecl
-		impDecl.Specs = append(impDecl.Specs, impSpec)
-		f.Imports = append(f.Imports, impSpec)
+		addImport(f, `"bolt"`)
+		extra += 1
+	}
+	if !fmtImported {
+		addImport(f, `"fmt"`)
+		extra += 1
 	}
 
 	buf := &bytes.Buffer{}
-	spec := &Spec{FileSet: fileset, Root: f}
+	spec := &Spec{FileSet: fileset, Root: f, Extra: extra}
 
 	// Find all the tasks.
 	for _, decl := range f.Decls {
@@ -142,15 +187,15 @@ func parseBoltfile(boltpath, boltdir string) (*Spec, error) {
 		if !ok {
 			continue
 		}
-		if funcDecl.Name.Name == "Init" {
+		if funcDecl.Name.Name == "onload" {
 			spec.Init = true
+			insertBoltContext(funcDecl)
 			continue
 		}
 		if funcDecl.Doc == nil {
 			continue
 		}
 		doc := strings.TrimSpace(funcDecl.Doc.Text())
-		funcDecl.Doc = nil
 		if doc == "" {
 			continue
 		}
@@ -173,18 +218,90 @@ func parseBoltfile(boltpath, boltdir string) (*Spec, error) {
 		task.Doc = doc
 		task.ID = buf.String()
 		spec.Tasks = append(spec.Tasks, task)
+		insertBoltContext(funcDecl)
 	}
 
-	// Strip out comments.
-	f.Comments = nil
-	f.Doc = nil
+	// Rewrite the AST.
+	visitor := &Rewriter{}
+	ast.Walk(visitor, f)
 
 	return spec, nil
 
 }
 
+func asExpr(s string) ast.Expr {
+	expr, err := parser.ParseExpr(s)
+	if err != nil {
+		panic(err)
+	}
+	return expr
+}
+
+type Rewriter struct{}
+
+func (r *Rewriter) Visit(node ast.Node) ast.Visitor {
+	switch n := node.(type) {
+	case *ast.AssignStmt:
+		for idx, stmt := range n.Lhs {
+			if sel, ok := stmt.(*ast.SelectorExpr); ok {
+				if expr, ok := sel.X.(*ast.Ident); ok && expr.Name == "ctx" {
+					attr := sel.Sel.Name
+					fname := ""
+					if attr == strings.ToUpper(attr) {
+						fname = "Setenv"
+					} else if attr == strings.ToLower(attr) {
+						fname = "Set"
+					}
+					if fname != "" {
+						nexpr := &ast.CallExpr{
+							Args: make([]ast.Expr, 2),
+							Fun: &ast.SelectorExpr{
+								X:   &ast.Ident{Name: "ctx"},
+								Sel: &ast.Ident{Name: fname},
+							},
+						}
+						nexpr.Args[0] = asExpr(strconv.Quote(attr))
+						nexpr.Args[1] = n.Rhs[idx]
+						n.Lhs[idx] = asExpr("_")
+						n.Rhs[idx] = nexpr
+					}
+				}
+			}
+		}
+	case *ast.CallExpr:
+		switch c := n.Fun.(type) {
+		case *ast.SelectorExpr:
+			if expr, ok := c.X.(*ast.Ident); ok && expr.Name == "ctx" {
+				attr := c.Sel.Name
+				if attr == strings.ToUpper(attr) {
+					c.Sel.Name = "Setenv"
+					n.Args = append(n.Args, nil)
+					copy(n.Args[1:], n.Args[:])
+					n.Args[0] = asExpr(strconv.Quote(attr))
+				}
+			}
+
+		case *ast.Ident:
+			if c.Name == "ctx" {
+				c.Name = "ctx.GetSettings"
+			}
+		}
+	case *ast.SelectorExpr:
+		if expr, ok := n.X.(*ast.Ident); ok && expr.Name == "ctx" {
+			attr := n.Sel.Name
+			if attr == strings.ToUpper(attr) {
+				n.Sel.Name = fmt.Sprintf("Getenv(%q)", attr)
+			} else if attr == strings.ToLower(attr) {
+				n.Sel.Name = fmt.Sprintf("Get(%q)", attr)
+			}
+		}
+	}
+	return r
+}
+
 func genExecutable(path, tempdir string, spec *Spec) error {
-	f, err := os.Create(filepath.Join(tempdir, "boltfile.go"))
+	fp := filepath.Join(tempdir, "boltfile.go")
+	f, err := os.Create(fp)
 	if err != nil {
 		return err
 	}
@@ -196,10 +313,12 @@ func genExecutable(path, tempdir string, spec *Spec) error {
 	for _, task := range spec.Tasks {
 		fmt.Fprintf(f, "\tbolt.Register(%q, %q, %s)\n", task.ID, task.Doc, task.FuncName)
 	}
+	f.Write([]byte("\tctx := bolt.NewContext()\n"))
 	if spec.Init {
-		f.Write([]byte("\tInit()\n"))
+		f.Write([]byte("\tonload(ctx)\n"))
 	}
-	f.Write([]byte("\tbolt.Main()\n}\n"))
+	f.Write([]byte("\tbolt.Main(ctx)\n"))
+	f.Write([]byte("\t_ = fmt.Println\n}\n"))
 	f.Close()
 	err = os.Chdir(tempdir)
 	if err != nil {
@@ -212,7 +331,7 @@ func genExecutable(path, tempdir string, spec *Spec) error {
 	cmd.Stdout = stdout
 	err = cmd.Run()
 	if err != nil {
-		e := "couldn't compile boltfile.go generated from the Boltfile"
+		e := "compiling " + fp + " generated from Boltfile"
 		n := true
 		if stdout.Len() > 0 {
 			out := strings.SplitN(stdout.String(), "\n", 2)
