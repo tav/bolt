@@ -4,13 +4,13 @@
 package bolt
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"github.com/tav/golly/log"
 	"github.com/tav/golly/optparse"
 	"github.com/tav/golly/runtime"
 	"github.com/tav/golly/yaml"
-	"bytes"
-	"errors"
-	"fmt"
 	"os"
 	"reflect"
 	"sort"
