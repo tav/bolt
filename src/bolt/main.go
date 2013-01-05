@@ -4,10 +4,10 @@
 package bolt
 
 import (
-	"amp/log"
-	"amp/optparse"
-	"amp/runtime"
-	"amp/yaml"
+	"github.com/tav/golly/log"
+	"github.com/tav/golly/optparse"
+	"github.com/tav/golly/runtime"
+	"github.com/tav/golly/yaml"
 	"bytes"
 	"errors"
 	"fmt"
